@@ -59,13 +59,14 @@ function ConnectedClients() {
         <div className="clients-table">
           <table>
             <thead>
-              <tr><th scope="col">Client ID</th><th scope="col">ช่วงเวลาส่ง</th><th scope="col">เชื่อมต่อเมื่อ</th></tr>
+              <tr><th scope="col">Client ID</th><th scope="col">ช่อง</th><th scope="col">ช่วงเวลาส่ง</th><th scope="col">เชื่อมต่อเมื่อ</th></tr>
             </thead>
             <tbody>
               {clients.map((client) => (
                 <tr key={client.id}>
                   <td><code>{client.id}</code></td>
-                  <td>{client.intervalSeconds} วินาที</td>
+                  <td>{client.channel === 'broadcast' ? 'Broadcast' : 'ตามเวลา'}</td>
+                  <td>{client.intervalSeconds == null ? '—' : `${client.intervalSeconds} วินาที`}</td>
                   <td><time dateTime={client.connectedAt}>{clientTimeFormat.format(new Date(client.connectedAt))}</time></td>
                 </tr>
               ))}
@@ -123,7 +124,7 @@ function BroadcastPage() {
       <Navigation broadcast />
       <header>
         <h1>Broadcast</h1>
-        <p className="intro">ส่งข้อความทันทีถึงไคลเอนต์ SSE ที่กำลังเชื่อมต่อ</p>
+        <p className="intro">ส่งข้อความทันทีถึงไคลเอนต์ที่เชื่อมต่อช่อง Broadcast</p>
       </header>
       <form className="panel broadcast-form" onSubmit={sendBroadcast}>
         <label htmlFor="broadcast-message">ข้อความ</label>
@@ -139,17 +140,15 @@ function BroadcastPage() {
   );
 }
 
-function App() {
+function StreamPanel({ eventName, title, endpoint, children }) {
   const [enabled, setEnabled] = useState(false);
   const [status, setStatus] = useState('closed');
-  const [intervalInput, setIntervalInput] = useState('');
-  const [interval, setInterval] = useState('');
   const [latest, setLatest] = useState(null);
-  const endpoint = interval ? `/api/events?intervalSeconds=${interval}` : '/api/events';
 
   useEffect(() => {
     if (!enabled) return;
 
+    setStatus('connecting');
     const source = new EventSource(endpoint);
     source.onopen = () => setStatus('open');
     source.onerror = () => {
@@ -160,26 +159,60 @@ function App() {
         setStatus('reconnecting');
       }
     };
-    const receiveMessage = (event) => {
+    source.addEventListener(eventName, (event) => {
       const { message } = JSON.parse(event.data);
-      setLatest({ message, receivedAt: new Date(), broadcast: event.type === 'broadcast' });
-    };
-    source.addEventListener('tick', receiveMessage);
-    source.addEventListener('broadcast', receiveMessage);
+      setLatest({ message, receivedAt: new Date() });
+    });
 
     return () => source.close();
-  }, [enabled, endpoint]);
+  }, [enabled, endpoint, eventName]);
 
   function toggleConnection() {
     setEnabled(!enabled);
     setStatus(enabled ? 'closed' : 'connecting');
   }
 
+  return (
+    <section className="panel stream-panel" aria-labelledby={`${eventName}-title`}>
+      <h2 id={`${eventName}-title`}>{title}</h2>
+      <div className="stream-controls">
+        <div className="connection">
+          <div className="status" role="status" data-state={status}>
+            <span aria-hidden="true" />
+            {statusLabels[status]}
+          </div>
+          <code>GET {endpoint}</code>
+        </div>
+        <button className="primary" type="button" onClick={toggleConnection}>
+          {enabled ? 'ตัดการเชื่อมต่อ' : 'เชื่อมต่อ'}
+        </button>
+      </div>
+      {children}
+      <div className="latest">
+        {latest ? (
+          <>
+            <p className="latest-label">ได้รับข้อความล่าสุดเมื่อ</p>
+            <time className="latest-time" dateTime={latest.receivedAt.toISOString()}>
+              {timeFormat.format(latest.receivedAt)}
+            </time>
+            <p className="latest-message" lang={eventName === 'tick' ? 'en' : undefined}>{latest.message}</p>
+          </>
+        ) : (
+          <p className="latest-empty">ยังไม่ได้รับข้อความ</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function App() {
+  const [intervalInput, setIntervalInput] = useState('');
+  const [interval, setInterval] = useState('');
+  const endpoint = interval ? `/api/events?intervalSeconds=${interval}` : '/api/events';
+
   function applyInterval(event) {
     event.preventDefault();
-    const nextInterval = intervalInput === '' ? '' : String(Number(intervalInput));
-    if (enabled && nextInterval !== interval) setStatus('connecting');
-    setInterval(nextInterval);
+    setInterval(intervalInput === '' ? '' : String(Number(intervalInput)));
   }
 
   return (
@@ -188,46 +221,20 @@ function App() {
       <header>
         <p className="stack">SPRING BOOT <span>→</span> REACT</p>
         <h1>Server-Sent Events</h1>
-        <p className="intro">รับข้อความจากเซิร์ฟเวอร์ตามช่วงเวลาที่กำหนด</p>
+        <p className="intro">เลือกเชื่อมต่อช่องข้อความตามเวลาหรือช่อง Broadcast ได้แยกกัน</p>
       </header>
 
-      <section className="panel" aria-label="การเชื่อมต่อ">
-        <div className="connection">
-          <div className="status" role="status" data-state={status}>
-            <span aria-hidden="true" />
-            {statusLabels[status]}
-          </div>
-          <code>GET {endpoint}</code>
-        </div>
-        <button className="primary" onClick={toggleConnection}>
-          {enabled ? 'ตัดการเชื่อมต่อ' : 'เชื่อมต่อ'}
-        </button>
-      </section>
-
-      <form className="panel interval-form" onSubmit={applyInterval}>
-        <label>
-          ส่งทุกกี่วินาที
-          <input type="number" min="1" max="2147483647" step="1" placeholder="1" value={intervalInput}
-            onChange={(event) => setIntervalInput(event.target.value)} />
-        </label>
-        <button type="submit">ใช้ช่วงเวลานี้</button>
-      </form>
-
-      <section className="panel latest" aria-labelledby="latest-title">
-        <h2 id="latest-title">ได้รับข้อความล่าสุดเมื่อ</h2>
-        {latest ? (
-          <>
-            <time className="latest-time" dateTime={latest.receivedAt.toISOString()}>
-              {timeFormat.format(latest.receivedAt)}
-            </time>
-            <p className="latest-message" lang={latest.broadcast ? undefined : 'en'}>{latest.message}</p>
-            {latest.broadcast && <p className="broadcast-kind">Broadcast</p>}
-          </>
-        ) : (
-          <p className="latest-empty">ยังไม่ได้รับข้อความ</p>
-        )}
-      </section>
-
+      <StreamPanel eventName="tick" title="ข้อความตามเวลา" endpoint={endpoint}>
+        <form className="interval-form" onSubmit={applyInterval}>
+          <label>
+            ส่งทุกกี่วินาที
+            <input type="number" min="1" max="2147483647" step="1" placeholder="1" value={intervalInput}
+              onChange={(event) => setIntervalInput(event.target.value)} />
+          </label>
+          <button type="submit">ใช้ช่วงเวลานี้</button>
+        </form>
+      </StreamPanel>
+      <StreamPanel eventName="broadcast" title="ข้อความ Broadcast" endpoint="/api/broadcast/events" />
       <ConnectedClients />
     </main>
   );

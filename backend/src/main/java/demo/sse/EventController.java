@@ -11,6 +11,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
 
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
@@ -38,7 +39,8 @@ public class EventController {
     );
 
     private final ScheduledExecutorService scheduler;
-    private final Map<UUID, Connection> clients = new ConcurrentHashMap<>();
+    private final Map<UUID, Connection> tickClients = new ConcurrentHashMap<>();
+    private final Map<UUID, Connection> broadcastClients = new ConcurrentHashMap<>();
     private final AtomicLong sequence = new AtomicLong();
 
     public EventController(ScheduledExecutorService scheduler) {
@@ -47,7 +49,7 @@ public class EventController {
 
     @GetMapping(path = "/api/clients", produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<List<Client>> connectedClients() {
-        var snapshot = clients.values().stream()
+        var snapshot = Stream.concat(tickClients.values().stream(), broadcastClients.values().stream())
                 .map(Connection::client)
                 .sorted(Comparator.comparing(Client::connectedAt))
                 .toList();
@@ -60,39 +62,50 @@ public class EventController {
         if (message.isEmpty() || message.length() > 500) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "message must contain 1–500 characters");
         }
-        Tick event = new Tick(sequence.incrementAndGet(), Instant.now().toString(), message);
+        StreamEvent event = new StreamEvent(sequence.incrementAndGet(), Instant.now().toString(), message);
         int sent = 0;
-        for (Connection connection : List.copyOf(clients.values())) {
+        for (Connection connection : List.copyOf(broadcastClients.values())) {
             try {
                 sendEvent(connection.emitter(), "broadcast", event);
                 sent++;
             } catch (IOException | IllegalStateException disconnected) {
-                clients.remove(connection.client().id());
+                broadcastClients.remove(connection.client().id());
             }
         }
         return new BroadcastResult(sent);
     }
 
     @GetMapping(path = "/api/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public ResponseEntity<SseEmitter> subscribe(
+    public ResponseEntity<SseEmitter> subscribeTicks(
             @RequestParam(name = "intervalSeconds", defaultValue = "1") int intervalSeconds) throws IOException {
         if (intervalSeconds < 1) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "intervalSeconds must be positive");
         }
 
+        return subscribe(tickClients, "tick", intervalSeconds);
+    }
+
+    @GetMapping(path = "/api/broadcast/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public ResponseEntity<SseEmitter> subscribeBroadcast() throws IOException {
+        return subscribe(broadcastClients, "broadcast", null);
+    }
+
+    private ResponseEntity<SseEmitter> subscribe(Map<UUID, Connection> clients, String channel,
+                                                 Integer intervalSeconds) throws IOException {
         SseEmitter emitter = new SseEmitter(0L);
         emitter.send(SseEmitter.event().comment("stream opened").reconnectTime(3000));
 
-        Client client = new Client(UUID.randomUUID(), intervalSeconds, Instant.now());
+        Client client = new Client(UUID.randomUUID(), channel, intervalSeconds, Instant.now());
         clients.put(client.id(), new Connection(client, emitter));
         var elapsedSeconds = new AtomicLong();
+        int periodSeconds = intervalSeconds == null ? 5 : 1;
         var task = scheduler.scheduleAtFixedRate(() -> {
             if (!clients.containsKey(client.id())) {
                 throw new IllegalStateException("SSE client disconnected");
             }
-            long elapsed = elapsedSeconds.incrementAndGet();
+            long elapsed = elapsedSeconds.addAndGet(periodSeconds);
             try {
-                if (elapsed % intervalSeconds == 0) {
+                if (intervalSeconds != null && elapsed % intervalSeconds == 0) {
                     sendTick(emitter);
                 } else if (elapsed % 5 == 0) {
                     emitter.send(SseEmitter.event().comment("keep-alive"));
@@ -102,7 +115,7 @@ public class EventController {
                 // An exception stops the periodic task. The servlet container handles I/O errors.
                 throw new IllegalStateException("SSE client disconnected", disconnected);
             }
-        }, 1, 1, TimeUnit.SECONDS);
+        }, periodSeconds, periodSeconds, TimeUnit.SECONDS);
         Runnable cleanup = () -> {
             clients.remove(client.id());
             task.cancel(false);
@@ -119,19 +132,19 @@ public class EventController {
 
     private void sendTick(SseEmitter emitter) throws IOException {
         String message = MESSAGES.get(ThreadLocalRandom.current().nextInt(MESSAGES.size()));
-        Tick tick = new Tick(sequence.incrementAndGet(), Instant.now().toString(), message);
+        StreamEvent tick = new StreamEvent(sequence.incrementAndGet(), Instant.now().toString(), message);
 
         sendEvent(emitter, "tick", tick);
     }
 
-    private void sendEvent(SseEmitter emitter, String name, Tick tick) throws IOException {
+    private void sendEvent(SseEmitter emitter, String name, StreamEvent event) throws IOException {
         emitter.send(SseEmitter.event()
-                .id(Long.toString(tick.id()))
+                .id(Long.toString(event.id()))
                 .name(name)
-                .data(tick, MediaType.APPLICATION_JSON));
+                .data(event, MediaType.APPLICATION_JSON));
     }
 
-    public record Client(UUID id, int intervalSeconds, Instant connectedAt) {}
+    public record Client(UUID id, String channel, Integer intervalSeconds, Instant connectedAt) {}
 
     private record Connection(Client client, SseEmitter emitter) {}
 
@@ -139,5 +152,5 @@ public class EventController {
 
     public record BroadcastResult(int sent) {}
 
-    public record Tick(long id, String timestamp, String message) {}
+    public record StreamEvent(long id, String timestamp, String message) {}
 }
